@@ -1,0 +1,265 @@
+trigger:
+- refs/tags/*
+- hotfix/*
+- features/*
+- bugfix/*
+- develop
+
+
+pool:
+  name: 'enablement-linux-agents-full'
+  demands:
+    - msbuild
+    - visualstudio
+    - vstest
+    - Cmd
+    - DotNetFramework
+    
+  
+  paths:
+    include:
+      - dotnet-core
+      
+name: $(Rev:rrrr)
+
+resources:
+  repositories:
+    - repository: templates
+      type: git
+      name: CIB-Digital Infrastructure/pipeline-templates
+
+variables:
+  - name: project-name
+    value: cib-markets-qa-report-portal-service
+  - name: deployable-artifact-name
+    value: Cib.Qa.RestAPI.TestRunner
+  - name: buildConfiguration
+    value: Release
+  - name: projects
+    value: "**/Cib.Qa.RestAPI.TestRunner.csproj"
+  - name: solution
+    value: "**/*.sln"
+  - name: drop
+    value: $(build.artifactstagingdirectory)/drop
+  - name: agents
+    value: enablement-linux-agents-full
+  - name: container-connection
+    value: artifactory
+  - name: deploy_env
+    value: dev
+  - name: projectFolder
+    value: "**/Cib.Qa.RestAPI.TestRunner"
+  - name: namespace
+    value: cib-fx-rates-distribution
+  - name: dotnet-version
+    value: 6.x
+  - name: external-artifactory-restore
+    value: 'Nuget (Artifactory) Basic Auth'
+  - name: container-connection
+    value: artifactory
+  - group: artifactory
+
+stages:
+  - stage: build
+    displayName: build
+
+    jobs:
+      - job: build
+        displayName: build
+        pool:
+          name: $(agents)
+        variables:
+          # Enable Code Coverage
+          - name: codecoverage.enabled
+            value: true
+        # Enable WhiteSource Bolt Scanning
+        #- name: whitesourcebolt.enabled
+        #  value: true
+        #- name: sonarqube.enabled
+        #  value: true
+        #- name: sonarqube.serviceconnectionname
+        #  value: sonarqube-prod
+        #- name: sonarqube.projectkey
+        #  value: $(chart-name)
+        #- name: sonarqube.projectname
+        #  value: $(chart-name)
+
+        steps:
+          - task: DownloadSecureFile@1
+            name: config
+            inputs:
+              secureFile: 'root-ca.tar.gz'
+              retryCount: '2'
+
+          - task: CopyFiles@2
+            inputs:
+              SourceFolder: '/workspace/_temp/'
+              Contents: 'root-ca.tar.gz'
+              TargetFolder: '$(drop)/$(project-name)'
+
+          - task: Bash@3
+            inputs:
+              targetType: "inline"
+              script: 
+                ls -al  $(drop)/$(project-name)
+
+
+        # Authenticate nuget.exe, dotnet, and MSBuild with Azure Artifacts and optionally other repositories
+          - task: NuGetAuthenticate@0
+            inputs:
+               nuGetServiceConnections: '$(external-artifactory-restore)'
+           
+          - task: UseDotNet@2
+            displayName: 'Set .Net Version: $(dotnet-version)'
+            inputs:
+               version: $(dotnet-version)
+               installationPath: $(Agent.ToolsDirectory)/dotnet
+
+          - task: qetza.replacetokens.replacetokens-task.replacetokens@3
+            displayName: 'Replace tokens in config'
+            inputs:
+              rootDirectory: $(Build.SourcesDirectory)/config
+              targetFiles: nuget.config
+              actionOnMissing: 'fail'
+
+          - task: Bash@3
+            inputs:
+              targetType: "inline"
+              script: 
+                ls -al  $(drop)/$(project-name)
+
+
+          - task: DotNetCoreCLI@2
+            displayName: "Restore Packages"
+            inputs:
+              command: 'restore'
+              projects: '$(solution)'
+              feedsToUse: 'config'
+              nugetConfigPath: '$(Build.SourcesDirectory)/config/nuget.config'
+              noCache: true
+              verbosityRestore: 'minimal'
+              externalFeedCredentials: '$(external-artifactory-restore)'
+
+          - task: DotNetCoreCLI@2
+            displayName: "dotnet build"
+            inputs:
+              command: build
+              projects: $(projects)
+              feedsToUse: select
+              versioningScheme: off
+              arguments: "--configuration $(buildConfiguration)"
+
+          - task: DotNetCoreCLI@2
+            displayName: "dotnet publish"
+            inputs:
+              command: publish
+              projects: $(projects)
+              publishWebProjects: false
+              arguments: '--configuration $(buildConfiguration) --no-build --output "$(drop)"'
+
+          - task: Bash@3
+            inputs:
+              targetType: "inline"
+              script: echo 'Listing drop directory'
+                ls */
+              workingDirectory: "$(drop)"
+
+          - task: CopyFiles@2
+            displayName: "copy deployment"
+            inputs:
+              SourceFolder: $(build.sourcesdirectory)/deployment
+              TargetFolder: $(drop)/deployment
+
+          - task: CopyFiles@2
+            displayName: "copy dockerfile"
+            inputs:
+              SourceFolder: $(build.sourcesdirectory)/deployment/charts/$(project-name)
+              Contents: dockerfile
+              TargetFolder: $(drop)/deployment/$(project-name) 
+              
+          - task: Bash@3
+            inputs:
+              targetType: "inline"
+              script: 
+                ls -al  $(drop)/deployment/$(project-name)
+
+          # The drop artifacts needs to be in a specific format.
+          # Refer to: https://dev.azure.com/absarails/CIB-Digital%20Infrastructure/_git/pipeline-templates?path=%2FREADME.md#pipeline-artifacts
+          - task: Bash@3
+            displayName: "Rename deployable artifact name to project-name.zip"
+            inputs:
+              targetType: inline
+              script: |
+
+                echo  "Copying certs : $(drop)/deployment/$(project-name)/Certificates"
+                ls -al  $(drop)/deployment/$(project-name)/Certificates
+                echo "ls DefaultWorkingDirectory"
+                ls $(System.DefaultWorkingDirectory)/Certificates
+                echo "Moving $(drop)/$(deployable-artifact-name).zip to $(project-name).zip"
+                echo "Before rename..."
+                ls -al $(drop)
+                mv $(drop)/$(deployable-artifact-name).zip $(drop)/$(project-name).zip  
+                echo "After rename..."
+                ls -al $(drop)
+
+          - task: PublishPipelineArtifact@0
+            displayName: "publish artifacts"
+            inputs:
+              artifactName: drop
+              targetPath: $(drop)
+
+  - ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
+      # This will build and push your docker container image. It will also add your helm chart to the pipeline artifacts.
+      - template: stages/publish-chart-container-v5.yaml@templates
+        parameters:
+          # docker container registry connection
+          containerRegistryConnection: $(container-connection)
+          # project name
+          projectName: $(project-name)
+          # build number
+          buildNumber: $(build.BuildNumber)
+          # agent pool
+          pool: $(agents)
+
+  - ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
+      #DEV
+      - template: deployment/deploy-service.yaml
+        parameters:
+          namespace: $(namespace)
+          projectName: $(project-name)
+          buildNumber: $(build.BuildNumber)
+          agents: $(agents)
+          environment: dev
+          environmentType: nonprod
+  - ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
+      #UAT
+      - template: deployment/deploy-service.yaml
+        parameters:
+          namespace: $(namespace)
+          projectName: $(project-name)
+          buildNumber: $(build.BuildNumber)
+          agents: $(agents)
+          environment: uat
+          environmentType: nonprod
+
+  - ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
+      #PPE
+      - template: deployment/deploy-service.yaml
+        parameters:
+          namespace: $(namespace)
+          projectName: $(project-name)
+          buildNumber: $(build.BuildNumber)
+          agents: $(agents)
+          environment: ppe
+          environmentType: nonprod
+
+  # - ${{ if ne(variables['Build.Reason'], 'PullRequest') }}:
+  #     #PROD
+  #     - template: deployment/deploy-service.yaml
+  #       parameters:
+  #         namespace: $(namespace)
+  #         projectName: $(project-name)
+  #         buildNumber: $(build.BuildNumber)
+  #         agents: $(agents)
+  #         environment: prod
+  #         environmentType: prod
